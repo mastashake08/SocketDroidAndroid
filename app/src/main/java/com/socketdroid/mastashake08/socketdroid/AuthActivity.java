@@ -36,7 +36,7 @@ public class AuthActivity extends AppCompatActivity {
     SharedPreferences prefs = null;
     final AsyncHttpClient client = new AsyncHttpClient(true, 80, 443);
     Random rnd = new Random();
-    int n = 100000 + rnd.nextInt(900000);
+    int n;
     /**
      * ATTENTION: This was auto-generated to implement the App Indexing API.
      * See https://g.co/AppIndexing/AndroidStudio for more information.
@@ -48,6 +48,7 @@ public class AuthActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_auth);
         prefs = getSharedPreferences("com.socketdroid.mastashake08.socketdroid", MODE_PRIVATE);
+        n = prefs.getInt("activation-code",100000 + rnd.nextInt(900000));
         setView(n);
         try {
             startWebSocket();
@@ -114,6 +115,7 @@ public class AuthActivity extends AppCompatActivity {
 
         TextView code = (TextView) findViewById(R.id.code);
         code.setText(Integer.toString(n));
+        prefs.edit().putInt("activation-code",n).commit();
     }
 
     /**

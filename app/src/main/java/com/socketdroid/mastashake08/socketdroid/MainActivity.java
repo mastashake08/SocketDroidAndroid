@@ -48,8 +48,25 @@ public class MainActivity extends AppCompatActivity {
             Intent intent = new Intent(getApplicationContext(), AuthActivity.class);
             startActivity(intent);
         }
+
+        startService();
         mStartService = (Button) findViewById(R.id.start_service);
         mStopService = (Button) findViewById(R.id.stop_service);
+        mStartService.setClickable(false);
+        if(prefs.getBoolean("service-running",false)){
+            //mStartService.setClickable(false);
+            //mStartService.setVisibility(View.GONE);
+            mStopService.setVisibility(View.VISIBLE);
+            mStopService.setClickable(true);
+        }
+        else{
+            mStartService.setClickable(true);
+            mStartService.setVisibility(View.VISIBLE);
+            mStopService.setClickable(false);
+            mStopService.setVisibility(View.GONE);
+        }
+
+
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             // TODO: Consider calling
             //    ActivityCompat#requestPermissions
@@ -82,7 +99,10 @@ public class MainActivity extends AppCompatActivity {
                 permissionsNeeded.add("Access Phone");
             if (!addPermission(permissionsList, Manifest.permission.READ_SMS))
                 permissionsNeeded.add("Access SMS");
-
+            if (!addPermission(permissionsList, Manifest.permission.SEND_SMS))
+                permissionsNeeded.add("Send SMS");
+            if (!addPermission(permissionsList, Manifest.permission.RECEIVE_BOOT_COMPLETED))
+                permissionsNeeded.add("Know When Phone Started");
             if (permissionsList.size() > 0) {
                 if (permissionsNeeded.size() > 0) {
                     // Need Rationale
@@ -95,24 +115,47 @@ public class MainActivity extends AppCompatActivity {
 
                     return;
                 }
+
+
+
                 requestPermissions(permissionsList.toArray(new String[permissionsList.size()]),
                         REQUEST_CODE_ASK_MULTIPLE_PERMISSIONS);
                 return;
             }
 
+
         }
     }
 
-    public void startService(View view) {
+    public void startService() {
         Log.i("Service","Started");
+        mStartService = (Button) findViewById(R.id.start_service);
+        mStopService = (Button) findViewById(R.id.stop_service);
+        mStartService.setClickable(false);
+        mStartService.setVisibility(View.GONE);
+        mStopService.setClickable(true);
+        mStopService.setVisibility(View.VISIBLE);
         startService(new Intent(getBaseContext(), MyService.class));
+    }
+
+    public void startService(View view){
+        startService();
     }
 
     // Method to stop the service
     public void stopService(View view) {
+        mStartService = (Button) findViewById(R.id.start_service);
+        mStopService = (Button) findViewById(R.id.stop_service);
+        mStopService.setClickable(false);
+        mStopService.setVisibility(View.GONE);
+        mStartService.setClickable(true);
+        mStartService.setVisibility(View.VISIBLE);
         Log.i("Service","Ended");
+
         stopService(new Intent(getBaseContext(), MyService.class));
     }
+
+
 }
 
 

