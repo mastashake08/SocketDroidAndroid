@@ -62,6 +62,7 @@ public class AuthActivity extends AppCompatActivity {
     }
 
     private void startWebSocket() throws URISyntaxException {
+
         final String id = UUID.randomUUID().toString();
         RequestParams params = new RequestParams();
         //"photos" is Name of the field to identify file on server
